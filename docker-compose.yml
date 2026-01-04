@@ -1,16 +1,32 @@
-# No version field needed for Docker Compose v1.27.0+
+version: '3.8'
+
 services:
+  qdrant-mcp-server:
+    build: .
+    container_name: qdrant-mcp-server
+    ports:
+      - "4000:4000"
+    environment:
+      - QDRANT_HOST=qdrant
+      - QDRANT_PORT=6333
+      - OLLAMA_HOST=ollama
+      - OLLAMA_PORT=11434
+    depends_on:
+      - qdrant
+      - ollama
+    networks:
+      - docker_default
+
   qdrant:
     image: qdrant/qdrant:latest
-    container_name: qdrant-mcp
+    container_name: qdrant
     ports:
       - "6333:6333"
       - "6334:6334"
     volumes:
-      - ./qdrant_storage:/qdrant/storage
-    environment:
-      - QDRANT__SERVICE__GRPC_PORT=6334
-    restart: unless-stopped
+      - qdrant_storage:/qdrant/storage
+    networks:
+      - docker_default
 
   ollama:
     image: ollama/ollama:latest
@@ -18,5 +34,14 @@ services:
     ports:
       - "11434:11434"
     volumes:
-      - ./ollama_storage:/root/.ollama
-    restart: unless-stopped
+      - ollama_storage:/root/.ollama
+    networks:
+      - docker_default
+
+volumes:
+  qdrant_storage:
+  ollama_storage:
+
+networks:
+  docker_default:
+    external: true

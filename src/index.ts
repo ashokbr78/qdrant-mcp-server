@@ -85,7 +85,7 @@ if (EMBEDDING_PROVIDER !== "ollama") {
   }
 }
 
-// Check if Ollama is running when using Ollama provider
+// Check if Ollama is running when using Ollama provider (non-blocking warning)
 async function checkOllamaAvailability() {
   if (EMBEDDING_PROVIDER === "ollama") {
     const baseUrl = process.env.EMBEDDING_BASE_URL || "http://localhost:11434";
@@ -94,7 +94,8 @@ async function checkOllamaAvailability() {
     try {
       const response = await fetch(`${baseUrl}/api/version`);
       if (!response.ok) {
-        throw new Error(`Ollama returned status ${response.status}`);
+        console.warn(`Warning: Ollama returned status ${response.status}`);
+        return;
       }
 
       // Check if the required embedding model exists
@@ -106,32 +107,31 @@ async function checkOllamaAvailability() {
       );
 
       if (!modelExists) {
-        let errorMessage = `Error: Model '${modelName}' not found in Ollama.\n`;
+        let warningMessage = `Warning: Model '${modelName}' not found in Ollama.\n`;
 
         if (isLocalhost) {
-          errorMessage +=
+          warningMessage +=
             `Pull it with:\n` +
             `  - Using Docker: docker exec ollama ollama pull ${modelName}\n` +
             `  - Or locally: ollama pull ${modelName}`;
         } else {
-          errorMessage +=
+          warningMessage +=
             `Please ensure the model is available on your Ollama instance:\n` +
             `  ollama pull ${modelName}`;
         }
 
-        console.error(errorMessage);
-        process.exit(1);
+        console.warn(warningMessage);
       }
     } catch (error) {
       const errorMessage =
         error instanceof Error
-          ? `Error: ${error.message}`
-          : `Error: Ollama is not running at ${baseUrl}.\n`;
+          ? `Warning: ${error.message}`
+          : `Warning: Ollama may not be running at ${baseUrl}`;
 
       let helpText = "";
       if (isLocalhost) {
         helpText =
-          `Please start Ollama:\n` +
+          `To start Ollama:\n` +
           `  - Using Docker: docker compose up -d\n` +
           `  - Or install locally: curl -fsSL https://ollama.ai/install.sh | sh\n` +
           `\nThen pull the embedding model:\n` +
@@ -144,8 +144,7 @@ async function checkOllamaAvailability() {
           `  - The embedding model is available (e.g., nomic-embed-text)`;
       }
 
-      console.error(`${errorMessage}\n${helpText}`);
-      process.exit(1);
+      console.warn(`${errorMessage}\n${helpText}`);
     }
   }
 }
@@ -1131,6 +1130,14 @@ async function startHttpServer() {
   const app = express();
   app.use(express.json({ limit: "10mb" }));
 
+  // Middleware: Ensure Accept header includes required formats for StreamableHTTPServerTransport
+  app.use((req, res, next) => {
+    if (!req.headers.accept || !req.headers.accept.includes("application/json")) {
+      req.headers.accept = "application/json, text/event-stream";
+    }
+    next();
+  });
+
   // Configure Express to trust proxy for correct IP detection
   app.set("trust proxy", true);
 
@@ -1220,11 +1227,11 @@ async function startHttpServer() {
   });
 
   app.post("/mcp", rateLimitMiddleware, async (req, res) => {
-    // Create a new server for each request
+    // Create a new server for each request (stateless mode)
     const requestServer = createServer();
     registerHandlers(requestServer);
 
-    // Create transport with enableJsonResponse
+    // Create transport with enableJsonResponse for stateless mode
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: undefined,
       enableJsonResponse: true,
@@ -1251,8 +1258,8 @@ async function startHttpServer() {
       // Connect server to transport
       await requestServer.connect(transport);
 
-      // Handle the request - this triggers message processing
-      // The response will be sent asynchronously when the server calls transport.send()
+      // Handle the request - transport manages streaming/SSE and response automatically
+      // Pass the already-parsed body as third parameter to avoid stream issues
       await transport.handleRequest(req, res, req.body);
 
       // Clean up AFTER the response finishes
@@ -1274,6 +1281,76 @@ async function startHttpServer() {
       clearTimeout(timeoutId);
       console.error("Error handling MCP request:", error);
       sendErrorResponse(res, -32603, "Internal server error");
+      await cleanup();
+    }
+  });
+
+  // GET handler for SSE stream establishment
+  app.get("/mcp", rateLimitMiddleware, async (req, res) => {
+    // Create a new server for each request (stateless mode)
+    const requestServer = createServer();
+    registerHandlers(requestServer);
+
+    // Create transport with enableJsonResponse for stateless mode
+    const transport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: undefined,
+      enableJsonResponse: true,
+    });
+
+    // Track cleanup state to prevent double cleanup
+    let cleanedUp = false;
+    const cleanup = async () => {
+      if (cleanedUp) return;
+      cleanedUp = true;
+      await transport.close().catch(() => {});
+      await requestServer.close().catch(() => {});
+    };
+
+    // Set a timeout for the request to prevent hanging
+    const timeoutId = setTimeout(() => {
+      if (!res.headersSent) {
+        res.status(504).json({
+          jsonrpc: "2.0",
+          error: { code: -32000, message: "Request timeout" },
+          id: null,
+        });
+      }
+      cleanup().catch((err) => {
+        console.error("Error during timeout cleanup:", err);
+      });
+    }, REQUEST_TIMEOUT_MS);
+
+    try {
+      // Connect server to transport
+      await requestServer.connect(transport);
+
+      // Handle the GET request for SSE stream
+      await transport.handleRequest(req, res);
+
+      // Clean up AFTER the response finishes
+      const cleanupHandler = () => {
+        clearTimeout(timeoutId);
+        cleanup().catch((err) => {
+          console.error("Error during response cleanup:", err);
+        });
+      };
+
+      res.on("finish", cleanupHandler);
+      res.on("close", cleanupHandler);
+      res.on("error", (err) => {
+        console.error("Response stream error:", err);
+        cleanupHandler();
+      });
+    } catch (error) {
+      clearTimeout(timeoutId);
+      console.error("Error handling MCP GET request:", error);
+      if (!res.headersSent) {
+        res.status(500).json({
+          jsonrpc: "2.0",
+          error: { code: -32603, message: "Internal server error" },
+          id: null,
+        });
+      }
       await cleanup();
     }
   });

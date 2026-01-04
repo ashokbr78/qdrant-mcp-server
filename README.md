@@ -34,9 +34,6 @@ git clone https://github.com/mhalder/qdrant-mcp-server.git
 cd qdrant-mcp-server
 npm install
 
-# Start services and pull model
-docker compose up -d
-docker exec ollama ollama pull nomic-embed-text
 
 # Build
 npm run build
